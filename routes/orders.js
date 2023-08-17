@@ -1,144 +1,182 @@
-const {
-  requireAuth,
-} = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { getOrders } = require('../controller/orders');
+const { Order, Product, User } = require('../models');
 
-/** @module orders */
 module.exports = (app, nextMain) => {
-  /**
-   * @name GET /orders
-   * @description Lista órdenes
-   * @path {GET} /orders
-   * @query {String} [page=1] Página del listado a consultar
-   * @query {String} [limit=10] Cantitad de elementos por página
-   * @header {Object} link Parámetros de paginación
-   * @header {String} link.first Link a la primera página
-   * @header {String} link.prev Link a la página anterior
-   * @header {String} link.next Link a la página siguiente
-   * @header {String} link.last Link a la última página
-   * @auth Requiere `token` de autenticación
-   * @response {Array} orders
-   * @response {String} orders[]._id Id
-   * @response {String} orders[].userId Id usuaria que creó la orden
-   * @response {String} orders[].client Clienta para quien se creó la orden
-   * @response {Array} orders[].products Productos
-   * @response {Object} orders[].products[] Producto
-   * @response {Number} orders[].products[].qty Cantidad
-   * @response {Object} orders[].products[].product Producto
-   * @response {String} orders[].status Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Date} orders[].dateEntry Fecha de creación
-   * @response {Date} [orders[].dateProcessed] Fecha de cambio de `status` a `delivered`
-   * @code {200} si la autenticación es correcta
-   * @code {401} si no hay cabecera de autenticación
-   */
-  app.get('/orders', requireAuth, (req, resp, next) => {
+  app.get('/orders', requireAuth, getOrders);
+
+  app.get('/orders/:orderId', requireAuth, async (req, resp) => {
+    try {
+      const { orderId } = req.params;
+      const order = await Order.findOne({
+        where: { id: orderId },
+        include: {
+          model: Product,
+          through: { attributes: ['quantity'] },
+        },
+      });
+
+      if (!order) {
+        return resp.status(404).json({ message: 'Ordem não encontrada' });
+      }
+
+      const responseOrder = {
+        id: order.id,
+        userId: order.userId,
+        client: order.client,
+        status: order.status,
+        dateEntry: order.dateEntry,
+        ...(order.status === 'Concluído' && {
+          dateProcessed: order.dateProcessed,
+        }),
+        Products: order.Products.map((product) => ({
+          id: product.id,
+          name: product.name,
+          price: product.price,
+          image: product.image,
+          type: product.type,
+          OrderProducts: {
+            quantity: product.OrderProducts.quantity,
+          },
+        })),
+      };
+
+      resp.status(200).json(responseOrder);
+    } catch (error) {
+      console.error(error);
+      resp.status(500).json({ message: 'Erro interno do servidor' });
+    }
   });
 
-  /**
-   * @name GET /orders/:orderId
-   * @description Obtiene los datos de una orden especifico
-   * @path {GET} /orders/:orderId
-   * @params {String} :orderId `id` de la orden a consultar
-   * @auth Requiere `token` de autenticación
-   * @response {Object} order
-   * @response {String} order._id Id
-   * @response {String} order.userId Id usuaria que creó la orden
-   * @response {String} order.client Clienta para quien se creó la orden
-   * @response {Array} order.products Productos
-   * @response {Object} order.products[] Producto
-   * @response {Number} order.products[].qty Cantidad
-   * @response {Object} order.products[].product Producto
-   * @response {String} order.status Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Date} order.dateEntry Fecha de creación
-   * @response {Date} [order.dateProcessed] Fecha de cambio de `status` a `delivered`
-   * @code {200} si la autenticación es correcta
-   * @code {401} si no hay cabecera de autenticación
-   * @code {404} si la orden con `orderId` indicado no existe
-   */
-  app.get('/orders/:orderId', requireAuth, (req, resp, next) => {
+  app.post('/orders', requireAuth, async (req, resp) => {
+    try {
+      const { userId, client, products } = req.body;
+
+      if (!userId || !client || !products || !products.length) {
+        return resp
+          .status(400)
+          .json({ message: 'Dados incompletos na requisição.' });
+      }
+
+      const existingUser = await User.findByPk(userId);
+      if (!existingUser) {
+        return resp
+          .status(404)
+          .json({ message: `Usuário com ID ${userId} não encontrado.` });
+      }
+
+      const order = await Order.create({
+        userId,
+        client,
+        status: 'Pendente',
+        dateEntry: new Date(),
+      });
+
+      const addProductPromises = products.map(async (productData) => {
+        const { qty, product } = productData;
+        const existingProduct = await Product.findByPk(product.id);
+
+        if (!existingProduct) {
+          return resp
+            .status(404)
+            .json({ message: `Produto com ID ${product.id} não encontrado.` });
+        }
+
+        await order.addProduct(existingProduct, { through: { quantity: qty } });
+      });
+
+      await Promise.all(addProductPromises);
+
+      const orderWithProducts = await Order.findByPk(order.id, {
+        include: {
+          model: Product,
+          through: { attributes: ['quantity'] },
+          attributes: { exclude: ['createdAt', 'updatedAt'] },
+        },
+        attributes: { exclude: ['createdAt', 'updatedAt'] },
+      });
+
+      const responseOrder = {
+        id: orderWithProducts.id,
+        userId: orderWithProducts.userId,
+        client: orderWithProducts.client,
+        status: orderWithProducts.status,
+        dateEntry: orderWithProducts.dateEntry,
+        Products: orderWithProducts.Products,
+      };
+
+      if (orderWithProducts.dateProcessed !== null) {
+        responseOrder.dateProcessed = orderWithProducts.dateProcessed;
+      }
+
+      return resp.status(201).json(responseOrder);
+    } catch (error) {
+      console.error(error);
+      return resp.status(500).json({ message: 'Erro interno do servidor' });
+    }
   });
 
-  /**
-   * @name POST /orders
-   * @description Crea una nueva orden
-   * @path {POST} /orders
-   * @auth Requiere `token` de autenticación
-   * @body {String} userId Id usuaria que creó la orden
-   * @body {String} client Clienta para quien se creó la orden
-   * @body {Array} products Productos
-   * @body {Object} products[] Producto
-   * @body {String} products[].productId Id de un producto
-   * @body {Number} products[].qty Cantidad de ese producto en la orden
-   * @response {Object} order
-   * @response {String} order._id Id
-   * @response {String} order.userId Id usuaria que creó la orden
-   * @response {String} order.client Clienta para quien se creó la orden
-   * @response {Array} order.products Productos
-   * @response {Object} order.products[] Producto
-   * @response {Number} order.products[].qty Cantidad
-   * @response {Object} order.products[].product Producto
-   * @response {String} order.status Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Date} order.dateEntry Fecha de creación
-   * @response {Date} [order.dateProcessed] Fecha de cambio de `status` a `delivered`
-   * @code {200} si la autenticación es correcta
-   * @code {400} no se indica `userId` o se intenta crear una orden sin productos
-   * @code {401} si no hay cabecera de autenticación
-   */
-  app.post('/orders', requireAuth, (req, resp, next) => {
+  app.patch('/orders/:orderId', requireAuth, async (req, res) => {
+    try {
+      const { orderId } = req.params;
+      const { status } = req.body;
+
+      const allowedStatusValues = ['Pendente', 'Processando', 'Concluído'];
+
+      if (!allowedStatusValues.includes(status)) {
+        return res.status(400).json({
+          message: `O valor do campo 'status' deve ser um dos seguintes: ${allowedStatusValues.join(
+            ', ',
+          )}`,
+        });
+      }
+
+      const order = await Order.findByPk(orderId);
+
+      if (!order) {
+        return res.status(404).json({ message: 'Ordem não encontrada' });
+      }
+
+      if (order.status !== 'Concluído' && status === 'Concluído') {
+        order.dateProcessed = new Date();
+      }
+
+      order.status = status;
+
+      await order.save();
+
+      const responseOrder = {
+        id: order.id,
+        userId: order.userId,
+        client: order.client,
+        status: order.status,
+        dateEntry: order.dateEntry,
+        dateProcessed: order.dateProcessed,
+      };
+
+      res.status(200).json(responseOrder);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: 'Erro interno do servidor' });
+    }
   });
 
-  /**
-   * @name PUT /orders
-   * @description Modifica una orden
-   * @path {PUT} /products
-   * @params {String} :orderId `id` de la orden
-   * @auth Requiere `token` de autenticación
-   * @body {String} [userId] Id usuaria que creó la orden
-   * @body {String} [client] Clienta para quien se creó la orden
-   * @body {Array} [products] Productos
-   * @body {Object} products[] Producto
-   * @body {String} products[].productId Id de un producto
-   * @body {Number} products[].qty Cantidad de ese producto en la orden
-   * @body {String} [status] Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Object} order
-   * @response {String} order._id Id
-   * @response {String} order.userId Id usuaria que creó la orden
-   * @response {Array} order.products Productos
-   * @response {Object} order.products[] Producto
-   * @response {Number} order.products[].qty Cantidad
-   * @response {Object} order.products[].product Producto
-   * @response {String} order.status Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Date} order.dateEntry Fecha de creación
-   * @response {Date} [order.dateProcessed] Fecha de cambio de `status` a `delivered`
-   * @code {200} si la autenticación es correcta
-   * @code {400} si no se indican ninguna propiedad a modificar o la propiedad `status` no es valida
-   * @code {401} si no hay cabecera de autenticación
-   * @code {404} si la orderId con `orderId` indicado no existe
-   */
-  app.put('/orders/:orderId', requireAuth, (req, resp, next) => {
-  });
+  app.delete('/orders/:orderId', requireAuth, async (req, resp) => {
+    try {
+      const uid = req.params.orderId;
+      const order = await Order.findOne({ where: { id: uid } });
 
-  /**
-   * @name DELETE /orders
-   * @description Elimina una orden
-   * @path {DELETE} /orders
-   * @params {String} :orderId `id` del producto
-   * @auth Requiere `token` de autenticación
-   * @response {Object} order
-   * @response {String} order._id Id
-   * @response {String} order.userId Id usuaria que creó la orden
-   * @response {String} order.client Clienta para quien se creó la orden
-   * @response {Array} order.products Productos
-   * @response {Object} order.products[] Producto
-   * @response {Number} order.products[].qty Cantidad
-   * @response {Object} order.products[].product Producto
-   * @response {String} order.status Estado: `pending`, `canceled`, `delivering` o `delivered`
-   * @response {Date} order.dateEntry Fecha de creación
-   * @response {Date} [order.dateProcessed] Fecha de cambio de `status` a `delivered`
-   * @code {200} si la autenticación es correcta
-   * @code {401} si no hay cabecera de autenticación
-   * @code {404} si el producto con `orderId` indicado no existe
-   */
-  app.delete('/orders/:orderId', requireAuth, (req, resp, next) => {
+      if (!order) {
+        return resp.status(404).json({ message: 'Ordem não encontrada' });
+      }
+
+      await order.destroy();
+
+      resp.status(200).json({ message: 'Ordem excluída com sucesso!' });
+    } catch (error) {
+      console.error(error);
+      resp.status(500).json({ message: 'Erro interno do servidor' });
+    }
   });
 
   nextMain();
