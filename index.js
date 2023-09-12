@@ -1,4 +1,5 @@
 const express = require('express');
+const pg = require('pg');
 const config = require('./config');
 const authMiddleware = require('./middleware/auth');
 const errorHandler = require('./middleware/error');
@@ -7,6 +8,13 @@ const pkg = require('./package.json');
 
 const { port, dbUrl, secret } = config;
 const app = express();
+
+const pgClient = new pg.Client({ connectionString: dbUrl });
+pgClient.connect();
+pgClient.query('SELECT NOW()', (err, res) => {
+  console.log(err, res);
+  pgClient.end();
+});
 
 // TODO: Conexión a la Base de Datos (MongoDB o MySQL)
 
